@@ -25,9 +25,14 @@ MAX_ATTEMPTS = 2           # tries per test: a failed call or an unusable reply 
 RETRY_WAIT_SECONDS = 60    # wait before a retry
 ONLY_TESTS = None          # e.g. [9, 10] to run only those tests (numbered 1-30 as in sample_code_questions.py)
 
+# one column per criterion score (c1_score, c2_score...), because needs_review depends on them: it is true when some
+# criteria are fully met and others not met at all in the same answer
+MAX_CRITERIA = max(len(test.question.rubric) for test in tests)
+CRITERIA_COLUMNS = [f"c{number}_score" for number in range(1, MAX_CRITERIA + 1)]
+
 COLUMNS = ["test_number", "category", "subject", "question", "student_code", "max_points", "expected_score",
-           "model_grade", "difference", "confidence", "needs_review", "tests_passed", "rubric_breakdown",
-           "student_feedback", "instructor_feedback", "status", "error", "attempts", "passed"]
+           "model_grade", "difference", "confidence", "needs_review", "review_reasons", "tests_passed", *CRITERIA_COLUMNS, "rubric_breakdown",
+           "student_feedback", "instructor_feedback", "status", "error", "model_attempts", "attempts", "passed"]
 
 sys.stdout.reconfigure(encoding="utf-8")  # so printing symbols never crashes a Windows console
 
@@ -45,6 +50,18 @@ def _recording_code_prompt(self, tests_report):
 PromptGenerator.get_code_grading_prompt = _recording_code_prompt
 
 
+RESULTS_DIR = Path(__file__).resolve().parent / "results"  # data/results, created on the first run
+
+
+def next_output_file(prefix):
+    """data/results/<prefix>_YYYY-MM-DD_N.csv, where N is 1 for the first file of the day and counts up."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    today = f"{datetime.now():%Y-%m-%d}"
+    taken = [int(path.stem.rsplit("_", 1)[1]) for path in RESULTS_DIR.glob(f"{prefix}_{today}_*.csv")
+             if path.stem.rsplit("_", 1)[1].isdigit()]
+    return RESULTS_DIR / f"{prefix}_{today}_{max(taken, default=0) + 1}.csv"
+
+
 def short(text, limit=300):
     return " ".join(str(text).split())[:limit]
 
@@ -60,15 +77,16 @@ def tests_passed_text():
 
 def grade_one(test):
     """Run one sample through the pipeline. Returns (result, attempts); result["status"] is
-    graded, injection_flagged or error."""
+    graded, injection_flagged, failed (the client gave up after its own retries and sent it to review)
+    or error (an unexpected exception reached this runner)."""
     last_error = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         captured.clear()
         try:
-            raw = GeminiClient.review_code_submission(test.question, test.test_answer)
-            if raw == "Prompt Injection Detected":
-                return {"status": "injection_flagged"}, attempt
-            return {"status": "graded", "tests_passed": tests_passed_text(), **json.loads(raw)}, attempt
+            # the client always returns one json shape, its "status" field is graded, injection_flagged or failed
+            result = json.loads(GeminiClient.review_code_submission(test.question, test.test_answer))
+            # read the recorded judge0 report only after the review ran, it is filled in while the review happens
+            return {"tests_passed": tests_passed_text(), **result}, attempt
         except Exception as error:  # Judge0 or API error, rate limit, malformed JSON, failed validation...
             last_error = f"{type(error).__name__}: {short(error)}"
             if attempt < MAX_ATTEMPTS:
@@ -77,11 +95,15 @@ def grade_one(test):
     return {"status": "error", "error": last_error, "tests_passed": tests_passed_text()}, MAX_ATTEMPTS
 
 
+def blank(value):
+    return "" if value is None else value
+
+
 def build_row(number, test, result, attempts):
     grade = result.get("grade")
     max_points = test.question.max_points
     passed = grade is not None and abs(grade - test.expected_score) <= TOLERANCE_FRACTION * max_points + 1e-9
-    return {
+    row = {
         "test_number": number,
         "category": test.category,
         "subject": test.question.subject_name,
@@ -91,22 +113,28 @@ def build_row(number, test, result, attempts):
         "expected_score": test.expected_score,
         "model_grade": "" if grade is None else grade,
         "difference": "" if grade is None else round(grade - test.expected_score, 2),
-        "confidence": result.get("confidence", ""),
-        "needs_review": result.get("needs_review", ""),
+        "confidence": blank(result.get("confidence")),
+        "needs_review": blank(result.get("needs_review")),
+        "review_reasons": "; ".join(result.get("review_reasons") or []),
         "tests_passed": result.get("tests_passed", ""),
         "rubric_breakdown": json.dumps(result["rubric_breakdown"], ensure_ascii=False) if "rubric_breakdown" in result else "",
         "student_feedback": result.get("student_feedback", ""),
         "instructor_feedback": result.get("instructor_feedback", ""),
         "status": result["status"],
-        "error": result.get("error", ""),
+        "error": blank(result.get("error")),
+        "model_attempts": blank(result.get("attempts")),  # model requests the client needed (1 = no retry)
         "attempts": attempts,
         "passed": "PASS" if passed else "FAIL",
     }
+    # the score the model gave each criterion, in its own column
+    for entry in result.get("rubric_breakdown") or []:
+        row[f"{entry['criteria_id']}_score"] = entry["score"]
+    return row
 
 
 def main():
     selected = [(n, t) for n, t in enumerate(tests, start=1) if ONLY_TESTS is None or n in ONLY_TESTS]
-    output_file = f"code_results_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    output_file = next_output_file("code_results")
     rows = []
     print(f"Running {len(selected)} of {len(tests)} code samples, results will be written to {output_file}\n")
 
@@ -142,7 +170,8 @@ def summarize(rows, output_file):
     if graded:
         error = sum(abs(r["difference"]) for r in graded) / len(graded)
         print(f"Mean absolute error on graded tests: {error:.2f} points | needs_review: {sum(bool(r['needs_review']) for r in graded)} of {len(graded)}")
-    print(f"Injection flagged: {sum(r['status'] == 'injection_flagged' for r in rows)} | errors: {sum(r['status'] == 'error' for r in rows)}")
+    retried = sum(r["model_attempts"] not in ("", 1) for r in rows)
+    print(f"Injection flagged: {sum(r['status'] == 'injection_flagged' for r in rows)} | failed (sent to review): {sum(r['status'] == 'failed' for r in rows)} | errors: {sum(r['status'] == 'error' for r in rows)} | needed a model retry: {retried}")
 
     by_category = defaultdict(lambda: [0, 0])
     for r in rows:
