@@ -1,10 +1,9 @@
-# External
-import judge0
-
 # Project
-from submission import Submission
-from data.sample_text_questions import tests
-from coding_question import CodingQuestion
+from fairgrade.submission import Submission
+from samples.sample_text_questions import tests
+from fairgrade.coding_question import CodingQuestion
+
+PYTHON = 71   # Judge0 language id for Python 3
 
 def main():
     print("Input:\n1-Text Questions 2-Coding Questions")
@@ -73,7 +72,7 @@ else:
                 {"id": "c2", "requirement": "Student uses if/elif/else (or equivalent) to handle all three cases", "weight_fraction": 0.25},
                 {"id": "c3", "requirement": "Student correctly compares the number against zero", "weight_fraction": 0.25},
                 {"id": "c4", "requirement": "Student prints the exact expected word for each case", "weight_fraction": 0.25}
-            ], judge0.PYTHON,
+            ], PYTHON,
             [("5", "Positive"), ("-7", "Negative"), ("0", "Zero"), ("1", "Positive"), ("-1", "Negative"), ("1000", "Positive"), ("-250", "Negative")])
 
         # Printing the question to the student
